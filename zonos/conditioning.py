@@ -13,7 +13,7 @@ class Conditioner(nn.Module):
         self,
         output_dim: int,
         name: str,
-        cond_dim: int | None = None,
+        cond_dim: int | None = None, 
         projection: Literal["none", "linear", "mlp"] = "none",
         uncond_type: Literal["learned", "none"] = "none",
         **kwargs,
@@ -50,11 +50,10 @@ class Conditioner(nn.Module):
         cond = self.project(cond)
         return cond
 
-
-# ------- ESPEAK CONTAINMENT ZONE ------------------------------------------------------------------------------------------------------------------------------------------------
+# --- ESPEAK CONTAINMENT ZONE ---
 import os
-import sys
 import re
+import sys
 import unicodedata
 
 import inflect
@@ -67,8 +66,8 @@ from sudachipy import Dictionary, SplitMode
 if sys.platform == "darwin":
     os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = "/opt/homebrew/lib/libespeak-ng.dylib"
 
-# --- Number normalization code from https://github.com/daniilrobnikov/vits2/blob/main/text/normalize_numbers.py ---
 
+# --- Number normalization code from https://github.com/daniilrobnikov/vits2/blob/main/text/normalize_numbers.py ---
 _inflect = inflect.engine()
 _comma_number_re = re.compile(r"([0-9][0-9\,]+[0-9])")
 _decimal_number_re = re.compile(r"([0-9]+\.[0-9]+)")
@@ -91,18 +90,20 @@ def _expand_dollars(m: re.Match) -> str:
     parts = match.split(".")
     if len(parts) > 2:
         return match + " dollars"  # Unexpected format
+    
     dollars = int(parts[0]) if parts[0] else 0
     cents = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    
     if dollars and cents:
         dollar_unit = "dollar" if dollars == 1 else "dollars"
         cent_unit = "cent" if cents == 1 else "cents"
-        return "%s %s, %s %s" % (dollars, dollar_unit, cents, cent_unit)
+        return f"{dollars} {dollar_unit}, {cents} {cent_unit}"
     elif dollars:
         dollar_unit = "dollar" if dollars == 1 else "dollars"
-        return "%s %s" % (dollars, dollar_unit)
+        return f"{dollars} {dollar_unit}"
     elif cents:
         cent_unit = "cent" if cents == 1 else "cents"
-        return "%s %s" % (cents, cent_unit)
+        return f"{cents} {cent_unit}"
     else:
         return "zero dollars"
 
@@ -121,7 +122,9 @@ def _expand_number(m: re.Match) -> str:
         elif num % 100 == 0:
             return _inflect.number_to_words(num // 100) + " hundred"
         else:
-            return _inflect.number_to_words(num, andword="", zero="oh", group=2).replace(", ", " ")
+            return _inflect.number_to_words(
+                num, andword="", zero="oh", group=2
+            ).replace(", ", " ")
     else:
         return _inflect.number_to_words(num, andword="")
 
@@ -136,13 +139,10 @@ def normalize_numbers(text: str) -> str:
     return text
 
 
-# --- Number normalization code end ---
-
-
 PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
 SPECIAL_TOKEN_IDS = [PAD_ID, UNK_ID, BOS_ID, EOS_ID]
 
-_punctuation = ';:,.!?¡¿—…"«»“”() *~-/\\&'
+_punctuation = ';:,.!?¡¿—…"«»""() *~-/\\&'
 _letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _letters_ipa = (
     "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
@@ -178,9 +178,13 @@ def normalize_jp_text(text: str, tokenizer=Dictionary(dict="full").create()) -> 
 def clean(texts: list[str], languages: list[str]) -> list[str]:
     texts_out = []
     for text, language in zip(texts, languages):
-        if "ja" in language:
+        if "ja" in language:  # Japanese
             text = normalize_jp_text(text)
-        else:
+        elif "ko" in language:  # Korean
+            # For Korean, do not call normalize_numbers.
+            # Let eSpeak handle number pronunciation directly.
+            pass
+        else:  # Other languages (including English by default)
             text = normalize_numbers(text)
         texts_out.append(text)
     return texts_out
@@ -189,7 +193,6 @@ def clean(texts: list[str], languages: list[str]) -> list[str]:
 @cache
 def get_backend(language: str) -> "EspeakBackend":
     import logging
-
     from phonemizer.backend import EspeakBackend
 
     logger = logging.getLogger("phonemizer")
@@ -219,7 +222,9 @@ def phonemize(texts: list[str], languages: list[str]) -> list[str]:
 class EspeakPhonemeConditioner(Conditioner):
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, **kwargs)
-        self.phoneme_embedder = nn.Embedding(len(SPECIAL_TOKEN_IDS) + len(symbols), output_dim)
+        self.phoneme_embedder = nn.Embedding(
+            len(SPECIAL_TOKEN_IDS) + len(symbols), output_dim
+        )
 
     def apply_cond(self, texts: list[str], languages: list[str]) -> torch.Tensor:
         """
@@ -234,9 +239,7 @@ class EspeakPhonemeConditioner(Conditioner):
         phoneme_embeds = self.phoneme_embedder(phoneme_ids.to(device))
 
         return phoneme_embeds
-
-
-# ------- ESPEAK CONTAINMENT ZONE ------------------------------------------------------------------------------------------------------------------------------------------------
+# --- ESPEAK CONTAINMENT ZONE END ---
 
 
 class FourierConditioner(Conditioner):
@@ -252,17 +255,26 @@ class FourierConditioner(Conditioner):
         assert output_dim % 2 == 0
         super().__init__(output_dim, **kwargs)
         self.register_buffer("weight", torch.randn([output_dim // 2, input_dim]) * std)
-        self.input_dim, self.min_val, self.max_val = input_dim, min_val, max_val
+        self.input_dim = input_dim
+        self.min_val = min_val
+        self.max_val = max_val
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == self.input_dim
         x = (x - self.min_val) / (self.max_val - self.min_val)  # [batch_size, seq_len, input_dim]
-        f = 2 * torch.pi * x.to(self.weight.dtype) @ self.weight.T  # [batch_size, seq_len, output_dim // 2]
+        # [batch_size, seq_len, output_dim // 2]
+        f = 2 * torch.pi * x.to(self.weight.dtype) @ self.weight.T  
         return torch.cat([f.cos(), f.sin()], dim=-1)  # [batch_size, seq_len, output_dim]
 
 
 class IntegerConditioner(Conditioner):
-    def __init__(self, output_dim: int, min_val: int = 0, max_val: int = 512, **kwargs):
+    def __init__(
+        self, 
+        output_dim: int, 
+        min_val: int = 0, 
+        max_val: int = 512, 
+        **kwargs
+    ):
         super().__init__(output_dim, **kwargs)
         self.min_val = min_val
         self.max_val = max_val
@@ -291,75 +303,76 @@ _cond_cls_map = {
 
 
 def build_conditioners(conditioners: list[dict], output_dim: int) -> list[Conditioner]:
-    return [_cond_cls_map[config["type"]](output_dim, **config) for config in conditioners]
+    return [
+        _cond_cls_map[config["type"]](output_dim, **config) 
+        for config in conditioners
+    ]
 
 
 class PrefixConditioner(Conditioner):
     def __init__(self, config: PrefixConditionerConfig, output_dim: int):
         super().__init__(output_dim, "prefix", projection=config.projection)
-        self.conditioners = nn.ModuleList(build_conditioners(config.conditioners, output_dim))
+        self.conditioners = nn.ModuleList(
+            build_conditioners(config.conditioners, output_dim)
+        )
         self.norm = nn.LayerNorm(output_dim)
-        self.required_keys = {c.name for c in self.conditioners if c.uncond_vector is None}
+        self.required_keys = {
+            c.name for c in self.conditioners if c.uncond_vector is None
+        }
 
     def forward(self, cond_dict: dict) -> torch.Tensor:
         if not set(cond_dict).issuperset(self.required_keys):
             raise ValueError(f"Missing required keys: {self.required_keys - set(cond_dict)}")
+        
         conds = []
         for conditioner in self.conditioners:
             conds.append(conditioner(cond_dict.get(conditioner.name)))
+        
         max_bsz = max(map(len, conds))
         assert all(c.shape[0] in (max_bsz, 1) for c in conds)
         conds = [c.expand(max_bsz, -1, -1) for c in conds]
+        
         return self.norm(self.project(torch.cat(conds, dim=-2)))
 
 
 supported_language_codes = [
     'af', 'am', 'an', 'ar', 'as', 'az', 'ba', 'bg', 'bn', 'bpy', 'bs', 'ca', 'cmn',
-    'cs', 'cy', 'da', 'de', 'el', 'en-029', 'en-gb', 'en-gb-scotland', 'en-gb-x-gbclan',
-    'en-gb-x-gbcwmd', 'en-gb-x-rp', 'en-us', 'eo', 'es', 'es-419', 'et', 'eu', 'fa',
-    'fa-latn', 'fi', 'fr-be', 'fr-ch', 'fr-fr', 'ga', 'gd', 'gn', 'grc', 'gu', 'hak',
-    'hi', 'hr', 'ht', 'hu', 'hy', 'hyw', 'ia', 'id', 'is', 'it', 'ja', 'jbo', 'ka',
-    'kk', 'kl', 'kn', 'ko', 'kok', 'ku', 'ky', 'la', 'lfn', 'lt', 'lv', 'mi', 'mk',
-    'ml', 'mr', 'ms', 'mt', 'my', 'nb', 'nci', 'ne', 'nl', 'om', 'or', 'pa', 'pap',
-    'pl', 'pt', 'pt-br', 'py', 'quc', 'ro', 'ru', 'ru-lv', 'sd', 'shn', 'si', 'sk',
-    'sl', 'sq', 'sr', 'sv', 'sw', 'ta', 'te', 'tn', 'tr', 'tt', 'ur', 'uz', 'vi',
-    'vi-vn-x-central', 'vi-vn-x-south', 'yue'
-]  # fmt: off
+    'cs', 'cy', 'da', 'de', 'el', 'en-029', 'en-gb', 'en-gb-scotland', 
+    'en-gb-x-gbclan', 'en-gb-x-gbcwmd', 'en-gb-x-rp', 'en-us', 'eo', 'es', 
+    'es-419', 'et', 'eu', 'fa', 'fa-latn', 'fi', 'fr-be', 'fr-ch', 'fr-fr', 'ga', 
+    'gd', 'gn', 'grc', 'gu', 'hak', 'hi', 'hr', 'ht', 'hu', 'hy', 'hyw', 'ia', 
+    'id', 'is', 'it', 'ja', 'jbo', 'ka', 'kk', 'kl', 'kn', 'ko', 'kok', 'ku', 
+    'ky', 'la', 'lfn', 'lt', 'lv', 'mi', 'mk', 'ml', 'mr', 'ms', 'mt', 'my', 'nb', 
+    'nci', 'ne', 'nl', 'om', 'or', 'pa', 'pap', 'pl', 'pt', 'pt-br', 'py', 'quc', 
+    'ro', 'ru', 'ru-lv', 'sd', 'shn', 'si', 'sk', 'sl', 'sq', 'sr', 'sv', 'sw', 
+    'ta', 'te', 'tn', 'tr', 'tt', 'ur', 'uz', 'vi', 'vi-vn-x-central', 
+    'vi-vn-x-south', 'yue'
+]
 
 
 def make_cond_dict(
     text: str = "It would be nice to have time for testing, indeed.",
     language: str = "en-us",
     speaker: torch.Tensor | None = None,
-    
     # Emotion vector from 0.0 to 1.0
     #   Is entangled with pitch_std because more emotion => more pitch variation
-    #                     VQScore and DNSMOS because they favor neutral speech
-    #
-    #                       Happiness, Sadness, Disgust, Fear, Surprise, Anger, Other, Neutral
+    #   VQScore and DNSMOS because they favor neutral speech
+    #   [Happiness, Sadness, Disgust, Fear, Surprise, Anger, Other, Neutral]
     emotion: list[float] = [0.3077, 0.0256, 0.0256, 0.0256, 0.0256, 0.0256, 0.2564, 0.3077],
-
     # Maximum frequency (0 to 24000), should be 22050 or 24000 for 44.1 or 48 kHz audio
     # For voice cloning use 22050
     fmax: float = 22050.0,
-    
-    # Standard deviation for pitch (0 to 400), should be 
-    #   20-45 for normal speech, 
-    #   60-150 for expressive speech, 
-    #   higher values => crazier samples
+    # Standard deviation for pitch (0 to 400)
+    # 20-45 for normal speech, 60-150 for expressive speech
+    # Higher values => crazier samples
     pitch_std: float = 20.0,
-
     # Speaking rate in phonemes per minute (0 to 40). 30 is very fast, 10 is slow.
     speaking_rate: float = 15.0,
-
     # Target VoiceQualityScore for the generated speech (0.5 to 0.8).
-    #   A list of values must be provided which represent each 1/8th of the audio.
-    #   You should unset for expressive speech.
-    # According to discord Chat this is only used for the hybrid model
+    # List of values representing each 1/8th of the audio.
+    # Unset for expressive speech.
     vqscore_8: list[float] = [0.78] * 8,
-
-    # CTC target loss
-    # Only used for the hybrid model
+    # CTC target loss - Only used for the hybrid model
     ctc_loss: float = 0.0,
     # Only used for the hybrid model
     dnsmos_ovrl: float = 4.0,
@@ -370,7 +383,7 @@ def make_cond_dict(
 ) -> dict:
     """
     A helper to build the 'cond_dict' that the model expects.
-    By default, it will generate a random speaker embedding
+    By default, it will generate a random speaker embedding.
     """
     assert language.lower() in supported_language_codes, "Please pick a supported language"
 
