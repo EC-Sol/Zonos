@@ -1,4 +1,7 @@
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+
+ENV HF_HOME /app/models
+
 RUN pip install uv
 
 RUN apt clean && \

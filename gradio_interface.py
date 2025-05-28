@@ -18,7 +18,7 @@ SPEAKER_EMBEDDING = None
 SPEAKER_AUDIO_PATH = None
 
 
-def load_model_if_needed(model_choice: str):
+def load_model_if_needed(model_choice: str = "Zyphra/Zonos-v0.1-hybrid"):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
     if CURRENT_MODEL_TYPE != model_choice:
         if CURRENT_MODEL is not None:
@@ -138,7 +138,7 @@ def generate_audio(
     confidence = float(confidence)
     quadratic = float(quadratic)
     seed = int(seed)
-    max_new_tokens = 86 * 60 * 60
+    max_new_tokens = 86 * 15
 
     # This is a bit ew, but works for now.
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
@@ -159,15 +159,15 @@ def generate_audio(
     processed_prefix_audio = None
     if prefix_audio is not None:
         wav_prefix, sr_prefix = torchaudio.load(prefix_audio)
-        wav_prefix = wav_prefix.mean(0, keepdim=True) # Ensure mono
-        # preprocess expects (wav: Tensor, sr: int) -> wav (Tensor), sr (int)
+        wav_prefix = wav_prefix.mean(0, keepdim=True)  # Ensure mono
+        # preprocess expects (wav: Tensor, sr: int) -> wav (Tensor)
         # input wav can be [B, T] or [T]. Output is [C, T_proc]
-        processed_wav_prefix, _ = selected_model.autoencoder.preprocess(wav_prefix, sr_prefix)
+        processed_wav_prefix = selected_model.autoencoder.preprocess(wav_prefix, sr_prefix)
         processed_wav_prefix = processed_wav_prefix.to(device, dtype=torch.float32)
         # encode expects [B, C, T_proc]
         processed_prefix_audio = selected_model.autoencoder.encode(processed_wav_prefix.unsqueeze(0))
 
-    current_prefix_codes = processed_prefix_audio # Initialize for chunking
+    current_prefix_codes = processed_prefix_audio  # Initialize for chunking
 
     emotion_tensor = torch.tensor(list(map(float, [e1, e2, e3, e4, e5, e6, e7, e8])), device=device)
     vq_val = float(vq_single)
@@ -186,7 +186,8 @@ def generate_audio(
             progress((i, total_chunks), desc=f"Processing text chunks... {total_chunks}")
             if len(current_chunk) + len(sentence) + 1 > CHAR_LIMIT and current_chunk:
                 chunk_count += 1
-                progress((i, total_chunks), desc=f"Processing text chunks... {chunk_count} / {int(len(text) / CHAR_LIMIT)}")
+                progress((i, total_chunks),
+                         desc=f"Processing text chunks... {chunk_count} / {int(len(text) / CHAR_LIMIT)}")
                 print(f'current_chunk: {current_chunk}')
 
                 # Generate audio for current_chunk
@@ -210,9 +211,29 @@ def generate_audio(
                 # It's initialized with processed_prefix_audio (user prefix) before the loop
                 # And updated from the previous chunk's output at the end of each iteration
 
+                # --- Logging for current_prefix_codes (inside loop) ---
+                print(f"--- Debug: Processing audio chunk {chunk_count} (loop iteration {i + 1}/{total_chunks}) ---")
+                if current_prefix_codes is None:
+                    print("Debug: current_prefix_codes is None")
+                else:
+                    print(f"Debug: current_prefix_codes.shape: {current_prefix_codes.shape}")
+                    print(f"Debug: current_prefix_codes.dtype: {current_prefix_codes.dtype}")
+                    # Basic stats (ensure tensor is on CPU for these if min/max/mean don't support CUDA for its dtype directly or for safety)
+                    # Or perform on device if supported and safe. current_prefix_codes should be on selected_model.device
+                    try:
+                        print(f"Debug: current_prefix_codes device: {current_prefix_codes.device}")
+                        print(f"Debug: current_prefix_codes min: {torch.min(current_prefix_codes)}")
+                        print(f"Debug: current_prefix_codes max: {torch.max(current_prefix_codes)}")
+                        print(
+                            f"Debug: current_prefix_codes mean: {torch.mean(current_prefix_codes.float())}")  # .float() for mean if original dtype not supported
+                    except Exception as e:
+                        print(f"Debug: Error getting stats for current_prefix_codes: {e}")
+                # --- End Logging ---
+
                 codes_chunk = selected_model.generate(
                     prefix_conditioning=conditioning_chunk,
-                    audio_prefix_codes=current_prefix_codes, # Uses user prefix for 1st chunk, then previous chunk's output
+                    audio_prefix_codes=current_prefix_codes,
+                    # Uses user prefix for 1st chunk, then previous chunk's output
                     max_new_tokens=max_new_tokens,
                     cfg_scale=cfg_scale,
                     batch_size=1,
@@ -222,25 +243,46 @@ def generate_audio(
                 )
                 wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
                 sr_out_chunk = selected_model.autoencoder.sampling_rate
-                if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1: # Ensure mono, [1, T]
+                if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:  # Ensure mono, [1, T]
                     wav_out_chunk = wav_out_chunk[0:1, :]
-                elif wav_out_chunk.dim() == 1: # if it's [T]
-                    wav_out_chunk = wav_out_chunk.unsqueeze(0) # make it [1, T]
+                elif wav_out_chunk.dim() == 1:  # if it's [T]
+                    wav_out_chunk = wav_out_chunk.unsqueeze(0)  # make it [1, T]
 
                 temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False,
                                                         dir="./temp_audio")
                 os.makedirs("./temp_audio", exist_ok=True)
-                torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk) # Save still expects [1, T] or [T]
+                torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0),
+                                sr_out_chunk)  # Save still expects [1, T] or [T]
                 output_audio_files.append(temp_file.name)
                 temp_file.close()
 
                 # Prepare prefix codes for the next iteration from the current chunk's output
-                # wav_out_chunk is on CPU, shape [1, num_samples]
-                wav_for_next_prefix = wav_out_chunk.to(device) # Move to device
-                # preprocess expects (wav: Tensor, sr: int) -> wav (Tensor), sr (int)
-                # input wav can be [B, T] or [T]. Output is [C, T_proc] e.g. [1, T_proc]
-                processed_wav_for_next_prefix, _ = selected_model.autoencoder.preprocess(wav_for_next_prefix, sr_out_chunk)
-                # encode expects [B, C, T_proc]
+                # wav_out_chunk is the result of selected_model.autoencoder.decode(codes_chunk).cpu().detach()
+                # As per subtask, assume wav_out_chunk is [1, 1, Samples_dec] in the problematic scenario.
+
+                # Step 1: Apply squeeze(1) to make wav_out_chunk 2D ([1, Samples_dec]) for preprocess.
+                # This ensures that if wav_out_chunk is [1, 1, num_samples], it becomes [1, num_samples].
+                if wav_out_chunk.dim() == 3 and wav_out_chunk.size(0) == 1 and wav_out_chunk.size(1) == 1:
+                    wav_for_preprocess_input = wav_out_chunk.squeeze(1)
+                elif wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) == 1:  # Already [1, T]
+                    wav_for_preprocess_input = wav_out_chunk
+                else:  # Fallback for other shapes not explicitly [1,1,T] or [1,T]
+                    print(
+                        f"Unexpected wav_out_chunk shape for prefix: {wav_out_chunk.shape}. Attempting reshape to [1, -1].")
+                    wav_for_preprocess_input = wav_out_chunk.reshape(1, -1)  # Attempt to make it [1, T]
+
+                wav_for_preprocess_input_device = wav_for_preprocess_input.to(device)
+
+                # Step 2: Preprocess.
+                # Input wav_for_preprocess_input_device is 2D [1, num_samples_dec].
+                # Output processed_wav_for_next_prefix should be 2D [1, num_samples_processed].
+                processed_wav_for_next_prefix = selected_model.autoencoder.preprocess(wav_for_preprocess_input_device,
+                                                                                      sr_out_chunk)
+
+                # Step 3: Encode.
+                # processed_wav_for_next_prefix is 2D [1, num_samples_processed].
+                # unsqueeze(0) makes it 3D [1, 1, num_samples_processed] for encode.
+                # This matches the required [Batch, Channels, Time] format.
                 current_prefix_codes = selected_model.autoencoder.encode(processed_wav_for_next_prefix.unsqueeze(0))
 
                 current_chunk = sentence + " "
@@ -268,9 +310,26 @@ def generate_audio(
             )
             conditioning_chunk = selected_model.prepare_conditioning(cond_dict_chunk)
             # current_prefix_codes will hold the prefix from the last processed chunk in the loop
+
+            # --- Logging for current_prefix_codes (final chunk) ---
+            print(f"--- Debug: Processing final audio chunk (chunk {chunk_count}) ---")
+            if current_prefix_codes is None:
+                print("Debug: current_prefix_codes is None")
+            else:
+                print(f"Debug: current_prefix_codes.shape: {current_prefix_codes.shape}")
+                print(f"Debug: current_prefix_codes.dtype: {current_prefix_codes.dtype}")
+                try:
+                    print(f"Debug: current_prefix_codes device: {current_prefix_codes.device}")
+                    print(f"Debug: current_prefix_codes min: {torch.min(current_prefix_codes)}")
+                    print(f"Debug: current_prefix_codes max: {torch.max(current_prefix_codes)}")
+                    print(f"Debug: current_prefix_codes mean: {torch.mean(current_prefix_codes.float())}")
+                except Exception as e:
+                    print(f"Debug: Error getting stats for current_prefix_codes: {e}")
+            # --- End Logging ---
+
             codes_chunk = selected_model.generate(
                 prefix_conditioning=conditioning_chunk,
-                audio_prefix_codes=current_prefix_codes, # Use the prefix from the previous chunk
+                audio_prefix_codes=current_prefix_codes,  # Use the prefix from the previous chunk
                 max_new_tokens=max_new_tokens,
                 cfg_scale=cfg_scale,
                 batch_size=1,
@@ -279,15 +338,15 @@ def generate_audio(
             )
             wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
             sr_out_chunk = selected_model.autoencoder.sampling_rate
-            if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1: # Ensure mono, [1, T]
+            if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:  # Ensure mono, [1, T]
                 wav_out_chunk = wav_out_chunk[0:1, :]
-            elif wav_out_chunk.dim() == 1: # if it's [T]
-                wav_out_chunk = wav_out_chunk.unsqueeze(0) # make it [1, T]
-
+            elif wav_out_chunk.dim() == 1:  # if it's [T]
+                wav_out_chunk = wav_out_chunk.unsqueeze(0)  # make it [1, T]
 
             temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="./temp_audio")
             os.makedirs("./temp_audio", exist_ok=True)
-            torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk) # Save still expects [1, T] or [T]
+            torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0),
+                            sr_out_chunk)  # Save still expects [1, T] or [T]
             output_audio_files.append(temp_file.name)
             temp_file.close()
             # No need to update current_prefix_codes here as this is the last chunk
@@ -297,7 +356,7 @@ def generate_audio(
     else:
         # Original logic for single audio file (text <= CHAR_LIMIT)
         # It should use the initial processed_prefix_audio if provided
-        current_prefix_codes = processed_prefix_audio # Ensure this is used for non-chunked generation too
+        current_prefix_codes = processed_prefix_audio  # Ensure this is used for non-chunked generation too
         cond_dict = make_cond_dict(
             text=text,
             language=language,
@@ -685,6 +744,7 @@ def build_interface():
 
 
 if __name__ == "__main__":
+    load_model_if_needed()
     demo = build_interface()
     share = getenv("GRADIO_SHARE", "False").lower() in ("true", "1", "t")
     demo.launch(server_name="0.0.0.0", server_port=7860, share=share)

@@ -16,6 +16,7 @@ services:
       - GRADIO_SHARE=False
     volumes:
       - ./:/app
+      - ./models_cache:/app/models
     deploy:
       resources:
         reservations:
