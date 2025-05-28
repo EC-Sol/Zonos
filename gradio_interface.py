@@ -159,10 +159,15 @@ def generate_audio(
     processed_prefix_audio = None
     if prefix_audio is not None:
         wav_prefix, sr_prefix = torchaudio.load(prefix_audio)
-        wav_prefix = wav_prefix.mean(0, keepdim=True)
-        wav_prefix = selected_model.autoencoder.preprocess(wav_prefix, sr_prefix)
-        wav_prefix = wav_prefix.to(device, dtype=torch.float32)
-        processed_prefix_audio = selected_model.autoencoder.encode(wav_prefix.unsqueeze(0))
+        wav_prefix = wav_prefix.mean(0, keepdim=True) # Ensure mono
+        # preprocess expects (wav: Tensor, sr: int) -> wav (Tensor), sr (int)
+        # input wav can be [B, T] or [T]. Output is [C, T_proc]
+        processed_wav_prefix, _ = selected_model.autoencoder.preprocess(wav_prefix, sr_prefix)
+        processed_wav_prefix = processed_wav_prefix.to(device, dtype=torch.float32)
+        # encode expects [B, C, T_proc]
+        processed_prefix_audio = selected_model.autoencoder.encode(processed_wav_prefix.unsqueeze(0))
+
+    current_prefix_codes = processed_prefix_audio # Initialize for chunking
 
     emotion_tensor = torch.tensor(list(map(float, [e1, e2, e3, e4, e5, e6, e7, e8])), device=device)
     vq_val = float(vq_single)
@@ -201,11 +206,13 @@ def generate_audio(
                 )
                 conditioning_chunk = selected_model.prepare_conditioning(cond_dict_chunk)
 
-                current_prefix_codes = processed_prefix_audio if not output_audio_files else None
+                # current_prefix_codes is now managed iteratively
+                # It's initialized with processed_prefix_audio (user prefix) before the loop
+                # And updated from the previous chunk's output at the end of each iteration
 
                 codes_chunk = selected_model.generate(
                     prefix_conditioning=conditioning_chunk,
-                    audio_prefix_codes=current_prefix_codes,
+                    audio_prefix_codes=current_prefix_codes, # Uses user prefix for 1st chunk, then previous chunk's output
                     max_new_tokens=max_new_tokens,
                     cfg_scale=cfg_scale,
                     batch_size=1,
@@ -215,15 +222,26 @@ def generate_audio(
                 )
                 wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
                 sr_out_chunk = selected_model.autoencoder.sampling_rate
-                if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:
+                if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1: # Ensure mono, [1, T]
                     wav_out_chunk = wav_out_chunk[0:1, :]
+                elif wav_out_chunk.dim() == 1: # if it's [T]
+                    wav_out_chunk = wav_out_chunk.unsqueeze(0) # make it [1, T]
 
                 temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False,
-                                                        dir="./temp_audio")  # Ensure dir exists or use default temp dir
-                os.makedirs("./temp_audio", exist_ok=True)  # Create dir if not exists
-                torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk)
+                                                        dir="./temp_audio")
+                os.makedirs("./temp_audio", exist_ok=True)
+                torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk) # Save still expects [1, T] or [T]
                 output_audio_files.append(temp_file.name)
                 temp_file.close()
+
+                # Prepare prefix codes for the next iteration from the current chunk's output
+                # wav_out_chunk is on CPU, shape [1, num_samples]
+                wav_for_next_prefix = wav_out_chunk.to(device) # Move to device
+                # preprocess expects (wav: Tensor, sr: int) -> wav (Tensor), sr (int)
+                # input wav can be [B, T] or [T]. Output is [C, T_proc] e.g. [1, T_proc]
+                processed_wav_for_next_prefix, _ = selected_model.autoencoder.preprocess(wav_for_next_prefix, sr_out_chunk)
+                # encode expects [B, C, T_proc]
+                current_prefix_codes = selected_model.autoencoder.encode(processed_wav_for_next_prefix.unsqueeze(0))
 
                 current_chunk = sentence + " "
             else:
@@ -249,10 +267,10 @@ def generate_audio(
                 unconditional_keys=unconditional_keys,
             )
             conditioning_chunk = selected_model.prepare_conditioning(cond_dict_chunk)
-            current_prefix_codes = processed_prefix_audio if not output_audio_files else None
+            # current_prefix_codes will hold the prefix from the last processed chunk in the loop
             codes_chunk = selected_model.generate(
                 prefix_conditioning=conditioning_chunk,
-                audio_prefix_codes=current_prefix_codes,
+                audio_prefix_codes=current_prefix_codes, # Use the prefix from the previous chunk
                 max_new_tokens=max_new_tokens,
                 cfg_scale=cfg_scale,
                 batch_size=1,
@@ -261,19 +279,25 @@ def generate_audio(
             )
             wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
             sr_out_chunk = selected_model.autoencoder.sampling_rate
-            if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:
+            if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1: # Ensure mono, [1, T]
                 wav_out_chunk = wav_out_chunk[0:1, :]
+            elif wav_out_chunk.dim() == 1: # if it's [T]
+                wav_out_chunk = wav_out_chunk.unsqueeze(0) # make it [1, T]
+
 
             temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="./temp_audio")
             os.makedirs("./temp_audio", exist_ok=True)
-            torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk)
+            torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk) # Save still expects [1, T] or [T]
             output_audio_files.append(temp_file.name)
             temp_file.close()
+            # No need to update current_prefix_codes here as this is the last chunk
 
         return (output_audio_files, seed)
 
     else:
         # Original logic for single audio file (text <= CHAR_LIMIT)
+        # It should use the initial processed_prefix_audio if provided
+        current_prefix_codes = processed_prefix_audio # Ensure this is used for non-chunked generation too
         cond_dict = make_cond_dict(
             text=text,
             language=language,
@@ -299,7 +323,7 @@ def generate_audio(
 
         codes = selected_model.generate(
             prefix_conditioning=conditioning,
-            audio_prefix_codes=processed_prefix_audio,  # Use the processed prefix audio
+            audio_prefix_codes=current_prefix_codes,  # Use the (potentially user-provided) prefix audio
             max_new_tokens=max_new_tokens,
             cfg_scale=cfg_scale,
             batch_size=1,

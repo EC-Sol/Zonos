@@ -178,9 +178,13 @@ def normalize_jp_text(text: str, tokenizer=Dictionary(dict="full").create()) -> 
 def clean(texts: list[str], languages: list[str]) -> list[str]:
     texts_out = []
     for text, language in zip(texts, languages):
-        if "ja" in language:
+        if "ja" in language: # Japanese
             text = normalize_jp_text(text)
-        else:
+        elif "ko" in language: # Korean
+            # For Korean, do not call normalize_numbers.
+            # Let eSpeak handle number pronunciation directly.
+            pass
+        else: # Other languages (including English by default)
             text = normalize_numbers(text)
         texts_out.append(text)
     return texts_out
