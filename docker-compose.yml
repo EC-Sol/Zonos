@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: zonos_container
-    runtime: nvidia
+    #runtime: nvidia
     network_mode: "host"
     stdin_open: true
     tty: true
@@ -14,3 +14,12 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - GRADIO_SHARE=False
+    volumes:
+      - ./:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

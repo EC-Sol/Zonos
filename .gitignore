@@ -11,3 +11,6 @@ wheels/
 
 # Misc.
 .ipynb_checkpoints/
+temp_audio
+
+.idea

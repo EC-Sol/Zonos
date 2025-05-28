@@ -2,6 +2,10 @@ import torch
 import torchaudio
 import gradio as gr
 from os import getenv
+import os
+import nltk
+import tempfile
+from pydub import AudioSegment
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
@@ -83,41 +87,42 @@ def update_ui(model_choice):
 
 
 def generate_audio(
-    model_choice,
-    text,
-    language,
-    speaker_audio,
-    prefix_audio,
-    e1,
-    e2,
-    e3,
-    e4,
-    e5,
-    e6,
-    e7,
-    e8,
-    vq_single,
-    fmax,
-    pitch_std,
-    speaking_rate,
-    dnsmos_ovrl,
-    speaker_noised,
-    cfg_scale,
-    top_p,
-    top_k,
-    min_p,
-    linear,
-    confidence,
-    quadratic,
-    seed,
-    randomize_seed,
-    unconditional_keys,
-    progress=gr.Progress(),
+        model_choice,
+        text,
+        language,
+        speaker_audio,
+        prefix_audio,
+        e1,
+        e2,
+        e3,
+        e4,
+        e5,
+        e6,
+        e7,
+        e8,
+        vq_single,
+        fmax,
+        pitch_std,
+        speaking_rate,
+        dnsmos_ovrl,
+        speaker_noised,
+        cfg_scale,
+        top_p,
+        top_k,
+        min_p,
+        linear,
+        confidence,
+        quadratic,
+        seed,
+        randomize_seed,
+        unconditional_keys,
+        progress=gr.Progress(),
 ):
     """
     Generates audio based on the provided UI parameters.
     We do NOT use language_id or ctc_loss even if the model has them.
     """
+
     selected_model = load_model_if_needed(model_choice)
 
     speaker_noised_bool = bool(speaker_noised)
@@ -133,13 +138,13 @@ def generate_audio(
     confidence = float(confidence)
     quadratic = float(quadratic)
     seed = int(seed)
-    max_new_tokens = 86 * 30
+    max_new_tokens = 86 * 60 * 60
 
     # This is a bit ew, but works for now.
     global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
 
     if randomize_seed:
-        seed = torch.randint(0, 2**32 - 1, (1,)).item()
+        seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
     if speaker_audio is not None and "speaker" not in unconditional_keys:
@@ -150,66 +155,305 @@ def generate_audio(
             SPEAKER_EMBEDDING = SPEAKER_EMBEDDING.to(device, dtype=torch.bfloat16)
             SPEAKER_AUDIO_PATH = speaker_audio
 
-    audio_prefix_codes = None
+    # Initial audio_prefix_codes setup
+    processed_prefix_audio = None
     if prefix_audio is not None:
         wav_prefix, sr_prefix = torchaudio.load(prefix_audio)
         wav_prefix = wav_prefix.mean(0, keepdim=True)
         wav_prefix = selected_model.autoencoder.preprocess(wav_prefix, sr_prefix)
         wav_prefix = wav_prefix.to(device, dtype=torch.float32)
-        audio_prefix_codes = selected_model.autoencoder.encode(wav_prefix.unsqueeze(0))
+        processed_prefix_audio = selected_model.autoencoder.encode(wav_prefix.unsqueeze(0))
 
     emotion_tensor = torch.tensor(list(map(float, [e1, e2, e3, e4, e5, e6, e7, e8])), device=device)
-
     vq_val = float(vq_single)
     vq_tensor = torch.tensor([vq_val] * 8, device=device).unsqueeze(0)
 
-    cond_dict = make_cond_dict(
-        text=text,
-        language=language,
-        speaker=SPEAKER_EMBEDDING,
-        emotion=emotion_tensor,
-        vqscore_8=vq_tensor,
-        fmax=fmax,
-        pitch_std=pitch_std,
-        speaking_rate=speaking_rate,
-        dnsmos_ovrl=dnsmos_ovrl,
-        speaker_noised=speaker_noised_bool,
-        device=device,
-        unconditional_keys=unconditional_keys,
-    )
-    conditioning = selected_model.prepare_conditioning(cond_dict)
+    output_audio_files = []
+    CHAR_LIMIT = 250  # Max characters per chunk for NLTK splitting
 
-    estimated_generation_duration = 30 * len(text) / 400
-    estimated_total_steps = int(estimated_generation_duration * 86)
+    if len(text) > CHAR_LIMIT:
+        sentences = nltk.sent_tokenize(text)
+        current_chunk = ""
+        chunk_count = 0
+        total_chunks = len(sentences)  # Approximate, as sentences are combined
 
-    def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
-        progress((step, estimated_total_steps))
-        return True
+        for i, sentence in enumerate(sentences):
+            progress((i, total_chunks), desc=f"Processing text chunks... {total_chunks}")
+            if len(current_chunk) + len(sentence) + 1 > CHAR_LIMIT and current_chunk:
+                chunk_count += 1
+                progress((i, total_chunks), desc=f"Processing text chunks... {chunk_count} / {int(len(text) / CHAR_LIMIT)}")
+                print(f'current_chunk: {current_chunk}')
 
-    codes = selected_model.generate(
-        prefix_conditioning=conditioning,
-        audio_prefix_codes=audio_prefix_codes,
-        max_new_tokens=max_new_tokens,
-        cfg_scale=cfg_scale,
-        batch_size=1,
-        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
-        callback=update_progress,
-    )
+                # Generate audio for current_chunk
+                cond_dict_chunk = make_cond_dict(
+                    text=current_chunk.strip(),
+                    language=language,
+                    speaker=SPEAKER_EMBEDDING,
+                    emotion=emotion_tensor,
+                    vqscore_8=vq_tensor,
+                    fmax=fmax,
+                    pitch_std=pitch_std,
+                    speaking_rate=speaking_rate,
+                    dnsmos_ovrl=dnsmos_ovrl,
+                    speaker_noised=speaker_noised_bool,
+                    device=device,
+                    unconditional_keys=unconditional_keys,
+                )
+                conditioning_chunk = selected_model.prepare_conditioning(cond_dict_chunk)
 
-    wav_out = selected_model.autoencoder.decode(codes).cpu().detach()
-    sr_out = selected_model.autoencoder.sampling_rate
-    if wav_out.dim() == 2 and wav_out.size(0) > 1:
-        wav_out = wav_out[0:1, :]
-    return (sr_out, wav_out.squeeze().numpy()), seed
+                current_prefix_codes = processed_prefix_audio if not output_audio_files else None
+
+                codes_chunk = selected_model.generate(
+                    prefix_conditioning=conditioning_chunk,
+                    audio_prefix_codes=current_prefix_codes,
+                    max_new_tokens=max_new_tokens,
+                    cfg_scale=cfg_scale,
+                    batch_size=1,
+                    sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence,
+                                         quad=quadratic),
+                    # No per-token callback for chunked generation to simplify
+                )
+                wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
+                sr_out_chunk = selected_model.autoencoder.sampling_rate
+                if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:
+                    wav_out_chunk = wav_out_chunk[0:1, :]
+
+                temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False,
+                                                        dir="./temp_audio")  # Ensure dir exists or use default temp dir
+                os.makedirs("./temp_audio", exist_ok=True)  # Create dir if not exists
+                torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk)
+                output_audio_files.append(temp_file.name)
+                temp_file.close()
+
+                current_chunk = sentence + " "
+            else:
+                current_chunk += sentence + " "
+
+        # Process the last remaining chunk
+        if current_chunk.strip():
+            chunk_count += 1
+            progress((total_chunks, total_chunks),
+                     desc="Processing final chunk...")  # Update progress for the last chunk
+            cond_dict_chunk = make_cond_dict(
+                text=current_chunk.strip(),
+                language=language,
+                speaker=SPEAKER_EMBEDDING,
+                emotion=emotion_tensor,
+                vqscore_8=vq_tensor,
+                fmax=fmax,
+                pitch_std=pitch_std,
+                speaking_rate=speaking_rate,
+                dnsmos_ovrl=dnsmos_ovrl,
+                speaker_noised=speaker_noised_bool,
+                device=device,
+                unconditional_keys=unconditional_keys,
+            )
+            conditioning_chunk = selected_model.prepare_conditioning(cond_dict_chunk)
+            current_prefix_codes = processed_prefix_audio if not output_audio_files else None
+            codes_chunk = selected_model.generate(
+                prefix_conditioning=conditioning_chunk,
+                audio_prefix_codes=current_prefix_codes,
+                max_new_tokens=max_new_tokens,
+                cfg_scale=cfg_scale,
+                batch_size=1,
+                sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence,
+                                     quad=quadratic),
+            )
+            wav_out_chunk = selected_model.autoencoder.decode(codes_chunk).cpu().detach()
+            sr_out_chunk = selected_model.autoencoder.sampling_rate
+            if wav_out_chunk.dim() == 2 and wav_out_chunk.size(0) > 1:
+                wav_out_chunk = wav_out_chunk[0:1, :]
+
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="./temp_audio")
+            os.makedirs("./temp_audio", exist_ok=True)
+            torchaudio.save(temp_file.name, wav_out_chunk.squeeze().unsqueeze(0), sr_out_chunk)
+            output_audio_files.append(temp_file.name)
+            temp_file.close()
+
+        return (output_audio_files, seed)
+
+    else:
+        # Original logic for single audio file (text <= CHAR_LIMIT)
+        cond_dict = make_cond_dict(
+            text=text,
+            language=language,
+            speaker=SPEAKER_EMBEDDING,
+            emotion=emotion_tensor,
+            vqscore_8=vq_tensor,
+            fmax=fmax,
+            pitch_std=pitch_std,
+            speaking_rate=speaking_rate,
+            dnsmos_ovrl=dnsmos_ovrl,
+            speaker_noised=speaker_noised_bool,
+            device=device,
+            unconditional_keys=unconditional_keys,
+        )
+        conditioning = selected_model.prepare_conditioning(cond_dict)
+
+        estimated_generation_duration = 30 * len(text) / 400
+        estimated_total_steps = int(estimated_generation_duration * 86)
+
+        def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
+            progress((step, estimated_total_steps), desc="Generating audio...")
+            return True
+
+        codes = selected_model.generate(
+            prefix_conditioning=conditioning,
+            audio_prefix_codes=processed_prefix_audio,  # Use the processed prefix audio
+            max_new_tokens=max_new_tokens,
+            cfg_scale=cfg_scale,
+            batch_size=1,
+            sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
+            callback=update_progress,
+        )
+        wav_out = selected_model.autoencoder.decode(codes).cpu().detach()
+        sr_out = selected_model.autoencoder.sampling_rate
+        if wav_out.dim() == 2 and wav_out.size(0) > 1:
+            wav_out = wav_out[0:1, :]
+
+        temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="./temp_audio")
+        os.makedirs("./temp_audio", exist_ok=True)
+        torchaudio.save(temp_file.name, wav_out.squeeze().unsqueeze(0), sr_out)
+        output_audio_files.append(temp_file.name)
+        temp_file.close()
+
+    # Merging logic for audio chunks
+    final_wav_path = None  # For clarity, though output_audio_files is the key return component
+    if output_audio_files:
+        if len(output_audio_files) > 1:
+            progress(0, 1, desc="Merging audio chunks...")  # Indicate merging start
+            try:
+                os.makedirs("./temp_audio", exist_ok=True)
+
+                # Load the first audio file to get its properties
+                first_waveform, sr = torchaudio.load(output_audio_files[0])
+                first_waveform = first_waveform.to(device)  # Ensure it's on the target device
+                audio_tensors = [first_waveform]
+
+                silence_duration_ms = 100
+                silence_frames = int(sr * (silence_duration_ms / 1000.0))
+                # Ensure silence tensor matches the first waveform's device and channel count
+                silence_tensor = torch.zeros((first_waveform.shape[0], silence_frames), dtype=first_waveform.dtype,
+                                             device=first_waveform.device)
+
+                for i in range(1, len(output_audio_files)):
+                    file_path = output_audio_files[i]
+                    audio_tensors.append(silence_tensor)
+                    waveform, current_sr = torchaudio.load(file_path)
+                    waveform = waveform.to(first_waveform.device)  # Move to the same device
+
+                    if current_sr != sr:
+                        print(
+                            f"Warning: Sample rate mismatch. Expected {sr}, got {current_sr} for {file_path}. Resampling.")
+                        waveform = torchaudio.transforms.Resample(current_sr, sr, device=first_waveform.device)(
+                            waveform)
+
+                    # Ensure channel count matches the first waveform (e.g., by taking mean for mono, or duplicating for stereo)
+                    if waveform.shape[0] != first_waveform.shape[0]:
+                        if first_waveform.shape[0] == 1:  # Target is mono
+                            waveform = waveform.mean(dim=0, keepdim=True)
+                        elif waveform.shape[0] == 1 and first_waveform.shape[0] > 1:  # Source is mono, target stereo
+                            waveform = waveform.expand(first_waveform.shape[0], -1)
+                        else:  # Fallback: convert current to mono if complex mismatch
+                            print(f"Complex channel mismatch for {file_path}, converting to mono.")
+                            waveform = waveform.mean(dim=0, keepdim=True)
+                            # If first_waveform was stereo, convert it to mono as well for consistency
+                            if first_waveform.shape[0] > 1:
+                                print("Converting first_waveform to mono due to channel mismatch.")
+                                first_waveform = first_waveform.mean(dim=0, keepdim=True)
+                                audio_tensors[0] = first_waveform  # Update the stored tensor
+                                # Recreate silence tensor for mono
+                                silence_tensor = torch.zeros((1, silence_frames), dtype=first_waveform.dtype,
+                                                             device=first_waveform.device)
+                                audio_tensors[i * 2 - 1] = silence_tensor  # Update previous silence if it was stereo
+
+                    audio_tensors.append(waveform)
+
+                merged_waveform = torch.cat(audio_tensors, dim=1)
+
+                merged_temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="./temp_audio")
+                torchaudio.save(merged_temp_file.name, merged_waveform.cpu(), sr)  # Save needs CPU tensor
+                final_wav_path = merged_temp_file.name
+                merged_temp_file.close()
+
+                # Delete original chunk files
+                original_chunk_paths = list(output_audio_files)  # Copy before modifying
+                for file_path in original_chunk_paths:
+                    try:
+                        if os.path.exists(file_path):  # Check if file still exists
+                            os.remove(file_path)
+                    except Exception as e:
+                        print(f"Error deleting chunk file {file_path}: {e}")
+
+                output_audio_files = [final_wav_path]  # Update to contain only the merged file
+                progress(1, 1, desc="Audio chunks merged.")
+            except Exception as e:
+                print(f"Error during audio merging: {e}")
+                # If merging fails, output_audio_files will retain original chunks.
+                # This might lead to multiple files in output if not handled by subsequent steps.
+        elif output_audio_files:  # Exactly one file
+            final_wav_path = output_audio_files[0]
+            # output_audio_files already contains the correct path, so no change needed to the list itself.
+
+    # If final_wav_path is None here, it means no audio was generated or an error occurred before this stage.
+    # The function will return output_audio_files which might be empty or contain original chunks if merging failed.
+
+    # MP3 Compression
+    if output_audio_files and output_audio_files[0].endswith(".wav"):  # Only process if we have a WAV file
+        wav_file_path = output_audio_files[0]
+        mp3_file_path = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir="./temp_audio").name
+
+        try:
+            # Attempt 1: Using torchaudio
+            progress(0, 1, desc="Compressing to MP3 (torchaudio)...")
+            waveform, sr = torchaudio.load(wav_file_path)
+            torchaudio.save(mp3_file_path, waveform, sr, format="mp3")
+            print(f"Successfully compressed to MP3 using torchaudio: {mp3_file_path}")
+            output_audio_files = [mp3_file_path]
+            progress(1, 1, desc="MP3 compression successful (torchaudio).")
+            try:
+                if os.path.exists(wav_file_path): os.remove(wav_file_path)
+            except OSError as e:
+                print(f"Error deleting temporary WAV file {wav_file_path}: {e}")
+        except Exception as e_torchaudio:
+            print(f"torchaudio MP3 conversion failed: {e_torchaudio}. Trying with pydub.")
+            progress(0, 1, desc="Compressing to MP3 (pydub)...")
+            # Attempt 2: Using pydub
+            try:
+                audio = AudioSegment.from_wav(wav_file_path)
+                audio.export(mp3_file_path, format="mp3")
+                print(f"Successfully compressed to MP3 using pydub: {mp3_file_path}")
+                output_audio_files = [mp3_file_path]
+                progress(1, 1, desc="MP3 compression successful (pydub).")
+                try:
+                    if os.path.exists(wav_file_path): os.remove(wav_file_path)
+                except OSError as e_remove_wav:
+                    print(f"Error deleting temporary WAV file {wav_file_path} after pydub conversion: {e_remove_wav}")
+            except Exception as e_pydub:
+                print(f"pydub MP3 conversion also failed: {e_pydub}")
+                progress(1, 1, desc="MP3 compression failed.")
+                print("MP3 conversion failed. Returning original WAV path.")
+                # output_audio_files already contains the WAV path
+                if os.path.exists(mp3_file_path):  # Clean up empty/failed mp3 file
+                    try:
+                        # Check size because NamedTemporaryFile creates an empty file
+                        if os.path.getsize(mp3_file_path) == 0:
+                            os.remove(mp3_file_path)
+                    except OSError:
+                        pass  # Ignore if deletion fails
+
+    return (output_audio_files, seed)
 
 
 def build_interface():
     supported_models = []
-    if "transformer" in ZonosBackbone.supported_architectures:
-        supported_models.append("Zyphra/Zonos-v0.1-transformer")
+
+    # if "transformer" in ZonosBackbone.supported_architectures:
+    #     supported_models.append("Zyphra/Zonos-v0.1-transformer")
 
     if "hybrid" in ZonosBackbone.supported_architectures:
         supported_models.append("Zyphra/Zonos-v0.1-hybrid")
+
     else:
         print(
             "| The current ZonosBackbone does not support the hybrid architecture, meaning only the transformer model will be available in the model selector.\n"
@@ -229,11 +473,10 @@ def build_interface():
                     label="Text to Synthesize",
                     value="Zonos uses eSpeak for text to phoneme conversion!",
                     lines=4,
-                    max_length=500,  # approximately
                 )
                 language = gr.Dropdown(
                     choices=supported_language_codes,
-                    value="en-us",
+                    value="ko",
                     label="Language Code",
                     info="Select a language code.",
                 )
@@ -268,10 +511,14 @@ def build_interface():
             with gr.Row():
                 with gr.Column():
                     gr.Markdown("### NovelAi's unified sampler")
-                    linear_slider = gr.Slider(-2.0, 2.0, 0.5, 0.01, label="Linear (set to 0 to disable unified sampling)", info="High values make the output less random.")
-                    #Conf's theoretical range is between -2 * Quad and 0.
-                    confidence_slider = gr.Slider(-2.0, 2.0, 0.40, 0.01, label="Confidence", info="Low values make random outputs more random.")
-                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic", info="High values make low probablities much lower.")
+                    linear_slider = gr.Slider(-2.0, 2.0, 0.5, 0.01,
+                                              label="Linear (set to 0 to disable unified sampling)",
+                                              info="High values make the output less random.")
+                    # Conf's theoretical range is between -2 * Quad and 0.
+                    confidence_slider = gr.Slider(-2.0, 2.0, 0.40, 0.01, label="Confidence",
+                                                  info="Low values make random outputs more random.")
+                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic",
+                                                 info="High values make low probablities much lower.")
                 with gr.Column():
                     gr.Markdown("### Legacy sampling")
                     top_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Top P")
@@ -318,7 +565,7 @@ def build_interface():
 
         with gr.Column():
             generate_button = gr.Button("Generate Audio")
-            output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
+            output_audio = gr.Audio(label="Generated Audio", type="filepath", autoplay=True)
 
         model_choice.change(
             fn=update_ui,
